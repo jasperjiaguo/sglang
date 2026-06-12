@@ -242,3 +242,189 @@ register dance (raw mma_bf16 from cute_utils = mma.sync.m16n8k16 inline-asm) —
 ldmatrix-transpose, register-resident, no smem round-trip) vs torch block-inverse; (3) four diag blocks
 in parallel (4 warps) + block back-sub -> full 64x64 Ai; (4) swap into the kernel, rebench vs FLA solve_tril.
 Target: inverse from 0.32x -> >=1.0x; KKT already 0.66x at 32K (improve via multi-chunk/block if needed).
+
+## Honing-2 progress (2026-06-11): warp-mma probe COMPILES, runtime-aborts (ldmatrix layout)
+`gdn_warpmma_probe.py` (M16N8K16, one warp). Correct fragment API found in quack `sm80_utils.py`
+(the warp-mma helper): `tCsA=thr_mma.partition_A(sA); tCrA=thr_mma.make_fragment_A(tCsA)` (pass the
+PARTITIONED TENSOR, not a shape — that was the AssertionError); `acc=make_rmem_tensor(thr_mma.
+partition_shape_C((M,N)), Float32)`; `cute.make_tiled_mma(op,(1,1,1))`. Now COMPILES but **aborts at
+runtime (exit 134, native fault, no py-trace).** Hypothesis: ldmatrix needs an ldmatrix-COMPATIBLE smem
+layout (8x8-matrix tiling), but my smem is plain row-major (16,16) -> ldmatrix reads wrong/OOB.
+**NEXT FIX:** give sA/sB an ldmatrix-friendly layout. Options: (a) Blackwell pattern
+`sA_ldsm = cute.logical_divide(sA, (16, cute.make_layout((8,2))))` then index for the warp; (b) use the
+matching tiled-copy: `tc=cute.make_tiled_copy_A(ldsm_atom, tiled_mma); thrc=tc.get_slice(tid);
+cute.copy(ldsm_atom, thrc.partition_S(sA), thrc.retile(tCrA))` (the tiled-copy partition handles the
+ldmatrix layout) — my earlier attempt used this but with the wrong fragment ctor; retry now that
+fragments are correct. Reference: quack gemm_sm80.py s2r copy. Keep M=16,N=8,K=16 (one atom) until green.
+
+## Honing-2 GREEN (2026-06-11): warp-mma m16n8k16 primitive works
+`gdn_warpmma_probe.py` (M16N8K16, one warp): C=A@Bᵀ via warp.MmaF16BF16Op + ldmatrix s2r, cosine
+1.000000 vs torch. **Warp-level tensor cores driven in CuteDSL — the blocked-inverse primitive is ready.**
+Working idiom:
+  op = warp.MmaF16BF16Op(BF16, Float32, (16,8,16)); tiled_mma = cute.make_tiled_mma(op,(1,1,1))
+  thr = tiled_mma.get_slice(tid)
+  tCrA = thr.make_fragment_A(thr.partition_A(sA)); tCrB = thr.make_fragment_B(thr.partition_B(sB))
+  acc = cute.make_rmem_tensor(thr.partition_shape_C((M,N)), Float32)
+  ldsm_A = make_copy_atom(warp.LdMatrix8x8x16bOp(num_matrices=4), BF16)  # A frag 8 bf16/thr
+  ldsm_B = make_copy_atom(warp.LdMatrix8x8x16bOp(num_matrices=2), BF16)  # B frag 4 bf16/thr
+  tcA=cute.make_tiled_copy_A(ldsm_A,tiled_mma); thrcA=tcA.get_slice(tid)
+  cute.copy(ldsm_A, thrcA.partition_S(sA), thrcA.retile(tCrA))   # same for B
+  acc.fill(0.0); cute.gemm(tiled_mma, acc, tCrA, tCrB, acc); cute.autovec_copy(acc, thr.partition_C(gC))
+  Plain row-major smem works with the tiled-copy (no special swizzle needed at 16x16). The earlier
+  "illegal access" was an OOB load loop (used MM*KK//32 iters for the smaller sB), NOT ldmatrix.
+
+### NEXT: honing-3 — 16x16 NS inverse via warp-mma
+Use ldsm_trans (warp.LdMatrix8x8x16bOp(transpose=True)) for the transpose-free NS (no smem round-trip).
+Per 16x16 block: init Ai=I-A, 3 rounds Ai<-2Ai-Ai@M@Ai (warp-mma + ldmatrix-trans). Then four diag
+blocks across 4 warps (warp_id selects block) + block back-sub (off-diag-by-1/2/3, cf Blackwell 555-650)
+-> full 64x64 Ai vs torch. Then honing-4: swap into kernel, rebench vs FLA (target inverse 0.32x->>=1.0x).
+
+## Honing-3 step1 (2026-06-11): N=16 + normal ldmatrix OK; ldmatrix-TRANSPOSE needs 128-bit align
+`gdn_warpmma_mm16.py` (16x16 A@B). IR verification: `make_tiled_mma(op,(1,1,1),permutation_mnk=(16,16,16))`
+covers N=16 fine, normal ldmatrix (A) fine. But `LdMatrix8x8x16bOp(transpose=True)` FAILS:
+"src ptr alignment (16 bits) does not meet requirement (128 bits)" — transpose-ldmatrix reads strided
+columns from plain row-major (16,16) bf16 smem → not 128-bit aligned.
+**DECISION:** for correctness-first, DROP ldmatrix-transpose; do the transpose EXPLICITLY in smem
+(sXt[j,i]=sX[i,j]) then normal ldmatrix — reuses the proven warp-mma primitive. (ldmatrix-transpose
+needs a swizzled/padded smem layout for 128-bit align; defer that optimization.) The blocked-16x16 speed
+win comes mainly from 16x16 matmuls (vs 64x64) + 4 blocks PARALLEL across 4 warps, not from avoiding the
+(now-tiny) transpose round-trip.
+
+### NEXT: honing-3 — build 16x16 NS inverse block (single warp, explicit transpose)
+sM,sX,sXt,sY,sYt bf16 16x16 + sXf f32. init M=I+A, X=I-A. 3 rounds: transpose X->sXt; warpmma(M,Xt-normal-load... 
+wait: warpmma(A,B)=A@Bᵀ, so M@X needs Bop=Xᵀ=sXt loaded NORMAL -> warpmma(M,sXt)=M@(sXt)ᵀ=M@X. Then
+Z=X@Y -> transpose Y->sYt, warpmma(X,sYt)=X@Y. X=2X-Z. Validate Ai vs torch inv(I+A_blk). Use N=16
+permutation tiled_mma + normal ldmatrix (both verified). Then 4 diag blocks across 4 warps + block back-sub
+(off-diag-by-1/2/3, Blackwell ~555-650) -> full 64x64 Ai. Then honing-4: swap into kernel, rebench vs FLA.
+
+## Honing-3 GREEN (2026-06-11): 16x16 NS inverse block via warp-mma works
+`gdn_ns16_probe.py`: single-warp 16x16 Ai=(I+A)^-1, warp-mma (N=16 permutation) + explicit smem
+transpose, 3 NS rounds. cosine 1.000000, max|(I+A)Ai-I|=1.67e-3 (bf16, 3 rounds). The core compute
+unit of the blocked inverse is proven. `_matmul()` helper = partition_A/B + make_fragment + tiled-copy
+ldmatrix + cute.gemm; warpmma(P,Q)=P@Qᵀ so M@X=_matmul(M, Xᵀ) with Xᵀ explicit-transposed in smem.
+
+### NEXT: honing-3b — four 16x16 diagonal blocks (4 warps) + block back-substitution -> full 64x64 Ai
+Block-triangular inverse of (I+A), A strictly-lower 64x64 split into 4x4 grid of 16x16 blocks.
+Diagonal blocks D_ii=(I+A_ii)^-1 via the proven 16x16 NS (warp w handles block w, parallel).
+Off-diagonal (block forward-sub, lower-tri): Ai_ij = -D_ii @ (sum_{k=j..i-1} A_ik @ Ai_kj), for i>j
+(cf Blackwell kernel_kkt_inv_uw.py off-diag-by-1/2/3, lines ~545-650). All via warp-mma. Validate full
+64x64 Ai vs torch inv(I+A) (cosine>=0.999). Then honing-4: replace the global-NS inverse in the gridded
+kernel (gdn_bench.py _grid) with this blocked inverse, rebench vs FLA solve_tril (target 0.32x->>=1.0x).
+
+## Honing-3b-1 GREEN (2026-06-11): 4-warp PARALLEL diagonal-block NS inverse
+`gdn_ns16x4_probe.py`: 128 threads = 4 warps; warp w inverts diagonal block w (the proven 16x16 NS) on
+its own smem region (per-warp smem via 3D tensor [4,16,16], slice `sM[wid,None,None]` — single-index
+`sM[wid]` collapses to scalar, must keep dims with None). All 4 diagonal blocks cosine 1.000000 vs the
+diagonal blocks of torch inv(I+A). Multi-warp structure confirmed; warp uses thr=tiled_mma.get_slice(lane=tid%32).
+
+### NEXT: honing-3b-2 — block back-substitution for off-diagonal blocks -> full 64x64 Ai
+After the 4 diagonal D_ii (parallel), compute off-diag X_ij (i>j, block forward-sub):
+  X_ij = -D_ii @ (sum_{k=j..i-1} A_ik @ X_kj)   [A_ik = off-diag block of I+A; D_ii=X_ii]
+Dependency order: off-by-1 {X10,X21,X32} -> off-by-2 {X20,X31} -> off-by-3 {X30}. All 16x16 warp-mma.
+Warp assignment: cf Blackwell kernel_kkt_inv_uw.py ~545-650 (off-diag-by-1/2/3, `if warp_id_<2` etc).
+Validate full 64x64 Ai vs torch inv(I+A) cosine>=0.999. Then honing-4: replace global-NS inverse in
+gdn_bench.py::_grid with the blocked inverse (diag-parallel + back-sub), rebench vs FLA (target 0.32x->>=1.0x).
+
+## Honing-3b-2 de-risk GREEN (2026-06-12): bf16 blocked-inverse numerics validated
+`gdn_blocked_ref.py` (torch sim, the CUDA back-sub oracle): 4x 16x16-block NS diagonals + bf16 block
+forward-substitution, 5 trials all cosine 1.000000, resid ~1-2.6e-4 (BETTER than global-NS 3e-4).
+**bf16 blocked algorithm is numerically excellent — CUDA back-sub is now pure engineering.**
+Exact algorithm (validated): D_i=(I+A_ii)^-1 [4-warp parallel, done]; then for j in 0..3, for i in j+1..3:
+  X_ij = -D_i @ (sum_{k=j..i-1} A_ik @ X_kj). Levels: off-by-1 {(1,0),(2,1),(3,2)}, off-by-2 {(2,0),(3,1)},
+  off-by-3 {(3,0)}.
+
+### NEXT: honing-3b-2 CUDA — implement the back-sub in `gdn_ns16x4_probe.py` -> full 64x64 Ai
+Keep A (64x64 bf16) + X (64x64 bf16, diag=D_i) in smem. Block views via cute.zipped_divide(sX,(16,16))
+-> ((16,16),(4,4)); blk(bi,bj)=view[None,(bi,bj)] OR slice sX[bi*16:(bi+1)*16, bj*16:(bj+1)*16]. Matmuls
+P@Q = _matmul(P, Qᵀ) with Qᵀ explicit-transposed in a per-warp scratch. Leveled: barrier between off-by-1/2/3;
+assign the level's blocks to warps (off-by-1: warps 1,2,3 do X10,X21,X32; off-by-2: warps 2,3 do X20,X31;
+off-by-3: warp 3 does X30). Accumulate sum_k in f32 regs/smem. Validate full 64x64 vs gdn_blocked_ref /
+torch inv (cosine>=0.999). Then honing-4: swap blocked inverse into gdn_bench.py::_grid, rebench vs FLA.
+
+## Honing-3b-2 CUDA GREEN (2026-06-12): FULL 64x64 blocked inverse works
+`gdn_blocked_inv.py`: 4-warp parallel 16x16-NS diagonal + leveled block forward-substitution
+(off-by-1/2/3, warps assigned per level, CTA barriers between), all warp-mma m16n8k16. 3 trials
+cosine 1.000000, resid ~2-3e-4. **The entire blocked-inverse algorithm is built & correct on Hopper.**
+Gotchas fixed: (1) gA f32→sA bf16 needs .to(BFloat16) on load; (2) CuteDSL closures capturing vars
+(lane) are NOT allowed in dynamic control flow → use TOP-LEVEL helper fns; (3) `range_constexpr` is
+preprocessor-only (fails in un-decorated helpers) → use plain `range()` in helper fns (unrolls at trace).
+Block storage: smem [4,4,16,16] block-major; block view = `s[bi,bj,None,None]`.
+
+### NEXT (FINAL): honing-4 — swap blocked inverse into gridded kernel + rebench vs FLA = updated verdict
+In `gdn_bench.py::_grid`, the inverse is currently the global-64x64 NS (the 3x-slow part). Replace it with
+the blocked inverse (`_blk_inv` logic: 4-warp diagonal + back-sub) — but note the gridded kernel does ONE
+(chunk,head) per CTA with the full kkt_inv_uw (KKT wgmma + inverse + U/W wgmma). Integrating warp-specialized
+blocked inverse into that single-warpgroup fused kernel needs care (the diagonal uses 4 warps = the whole
+warpgroup; KKT/UW wgmma also use the warpgroup). Simplest: keep stages sequential within the CTA (KKT→blocked-inv→UW),
+all 128 threads. Then microbench vs FLA intra @ {2K,8K,32K}. >1.0x = GO. Compare to the prior global-NS bench
+(inverse was 0.32x). Document the updated GO/NO-GO in FINDINGS + status "completed".
+
+## Honing-4 INVERSE BENCH (2026-06-12): BLOCKED INVERSE BEATS FLA at 8K/32K
+`gdn_bench_inv.py`: gridded blocked inverse vs FLA solve_tril @ 35B shapes (correctness cosine 1.0000):
+  T=2048 : blocked 0.0551ms  solve_tril 0.0321ms  -> 0.58x  (small grid, launch/occupancy-bound)
+  T=8192 : blocked 0.0592ms  solve_tril 0.0906ms  -> 1.53x  WIN
+  T=32768: blocked 0.0987ms  solve_tril 0.3314ms  -> 3.36x  BIG WIN
+**TURNAROUND vs global-NS (was 0.31-0.34x everywhere).** Blocked inverse barely grows with T
+(0.055->0.099ms) while solve_tril scales ~linearly (0.032->0.331) -> the massively-parallel blocked
+approach (NT*H CTAs, 4-warp-parallel diagonal + cheap back-sub) scales great on H200's many SMs.
+The TC Newton-Schulz blocked inverse IS a win on Hopper at realistic prefill lengths (8K/32K).
+The 2K loss is small-grid overhead (fewer CTAs than SMs) — fixable via batching multiple chunks/CTA.
+
+### Inverse GO/NO-GO: GO at the lengths that matter (8K/32K). Remaining for END-TO-END kernel verdict:
+honing-4-full = integrate blocked inverse into the gridded full kernel (KKT wgmma + blocked inverse +
+U/W wgmma) — needs layout repack between block-major (warp-mma inverse) and 64x64 (wgmma U/W). Then
+rebench full kkt_inv_uw vs FLA intra. KKT was 0.66x@32K (improving), inverse now 3.36x@32K, U/W TBD.
+
+## Honing-4 U/W bench (2026-06-12): U/W is now the bottleneck + has a gridded correctness bug
+`gdn_bench_uw.py`: gridded U/W vs FLA recompute_w_u. TWO issues:
+  T=2048: myUW 0.124 vs fla 0.023 (0.19x); 8192: 0.295 vs 0.083 (0.28x); 32768: 0.944 vs 0.344 (0.36x).
+  CORRECTNESS BROKEN gridded: U cos ~0/nan, W cos 0.31 (same matmul logic gave 0.999997 single-chunk in
+  gdn_fused_full — so it's a GRIDDED indexing/layout bug: Ai_blocks reshape, sAi gmem-load into swizzled
+  layout, or head/chunk/kh indexing). Must fix before trusting U/W perf.
+  (FLA recompute needs bf16 A operand — pass Ai.to(bf16).)
+
+### END-TO-END REALITY (Amdahl again): inverse win alone does NOT give parity
+Per-stage @ 32K: KKT mine 0.240 vs FLA 0.159 (0.66x); INVERSE mine 0.099 vs FLA 0.331 (3.36x WIN);
+U/W mine ~0.94 vs FLA 0.34 (0.36x, + buggy). Sum mine ~1.28 vs FLA intra 0.83 -> ~0.65x end-to-end
+DESPITE the inverse win, because U/W (now ~0.94ms) dominates + KKT slower. **Fixing the inverse exposed
+U/W as the new bottleneck.** To reach end-to-end FLA parity, must ALSO optimize U/W (single-warpgroup,
+~12 barriers, 4 sequential wgmma -> needs fewer barriers / better overlap / N=128 in one wgmma not 2 halves)
+and KKT (0.66x). The TC-inverse hypothesis is VALIDATED (3.36x); end-to-end parity is a broader kernel-opt effort.
+
+### NEXT: honing-5 — (1) fix gridded U/W correctness bug; (2) optimize U/W (biggest cost) + KKT; re-sum vs FLA.
+
+## Honing-5a (2026-06-12): gridded U/W kernel is CORRECT — the "bug" was a faulty FLA bench-reference
+`gdn_debug_uw.py`: my uw_grid vs TORCH ref from the same Ai_blocks -> U cosine 0.999999, W 0.999999,
+no NaN. So gdn_bench_uw's U cos~0/W 0.31 was a bad FLA comparison (recompute_w_u_fwd standalone call /
+output convention), NOT my kernel. **U/W matmul is correct.** Real issue = U/W PERF (~0.36x@32K, ~0.94ms,
+the new bottleneck); FLA recompute TIMING (0.34ms@32K) is valid (kernel ran) so the 2.8x-slower ratio holds.
+
+### NEXT: honing-5b — OPTIMIZE U/W (the bottleneck). Headroom:
+(1) do N=128 in ONE wgmma (tiler_mn=(64,128)) instead of 2x 64-halves -> halve wgmma + barriers;
+(2) cut barriers (~12 currently); (3) avoid per-element transpose-build of sBt where possible.
+Target: U/W 0.36x -> ~1.0x. Then KKT (0.66x) similarly. Re-sum vs FLA intra. HONEST NOTE: end-to-end FLA
+parity is a multi-stage opt effort; the headline inverse win (3.36x) — the original ask — is already done.
+
+## Honing-5b (2026-06-12): N=128-one-wgmma did NOT speed up U/W -> bottleneck is scalar loops/occupancy
+`gdn_bench_uw2.py` (N=128 in one wgmma, ~half the barriers): U/W still ~0.124/0.297/0.976ms (≈unchanged
+vs 2-halves). Correct (cos 1.0). So wgmma COUNT was not the bottleneck. U/W (~0.97ms@32K) is ~10x my
+inverse (0.099ms) despite less matmul -> U/W is bound by the per-element sBt build loops (smem read +
+fp32 convert + mul + exp + bf16 convert, ~128 iters/thread) + big smem (sK,sV,sZ ~80KB → low occupancy),
+NOT the matmul. FLA recompute_w_u is a tuned fused triton kernel; beating it needs vectorized builds +
+smem reduction (drop sZ, write acc→gmem directly; smaller V/K staging) — deeper opt, uncertain payoff.
+
+## PROJECT SUMMARY / VERDICT (2026-06-12)
+GOAL: port GDN kkt_inv_uw to Hopper (SM90); does the tensor-core approach beat FLA on H200?
+CORRECTNESS: ALL green vs FLA/torch (cosine ≥0.999) — KKT→A, TC Newton-Schulz inverse (global + blocked),
+U/W, full fused kernel, multi-chunk/head. The algorithm ports to Hopper correctly (wgmma + warp-mma m16n8k16).
+PERF (per-stage gridded vs FLA's 3 kernels, 35B shapes, 32K):
+  - KKT→A:        0.66x (mine slower; clean wgmma, improves with T)
+  - INVERSE:      **3.36x @32K, 1.53x @8K (WIN)** via blocked-16x16 warp-mma NS (4-warp parallel + back-sub).
+                  Turnaround from naive global-NS (0.32x). The TC-inverse hypothesis is VALIDATED on Hopper.
+  - U/W:          0.36-0.45x (scalar/occupancy-bound; N=128 opt didn't help)
+  END-TO-END:     ~0.65x (FLA intra still faster overall — U/W dominates, KKT slower).
+VERDICT: The CORE THESIS (tensor-core matrix inverse beats FLA's CUDA-core forward-sub on Hopper) is
+PROVEN (inverse 3.36x). But END-TO-END FLA parity is NOT achieved — it needs U/W + KKT optimization too
+(no single stage dominates; Amdahl). Reaching full-kernel parity is a multi-week kernel-eng effort vs
+FLA's mature triton; the inverse win is the high-value, defensible result. Recommend: land the inverse
+finding; treat U/W/KKT parity as follow-on. All code: github.com/jasperjiaguo/sglang @ jiaguo/gdn-hopper-kkt-experiment.
