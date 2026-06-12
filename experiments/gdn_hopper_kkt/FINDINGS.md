@@ -428,3 +428,58 @@ PROVEN (inverse 3.36x). But END-TO-END FLA parity is NOT achieved — it needs U
 (no single stage dominates; Amdahl). Reaching full-kernel parity is a multi-week kernel-eng effort vs
 FLA's mature triton; the inverse win is the high-value, defensible result. Recommend: land the inverse
 finding; treat U/W/KKT parity as follow-on. All code: github.com/jasperjiaguo/sglang @ jiaguo/gdn-hopper-kkt-experiment.
+
+## Honing-5c (2026-06-12): U/W occupancy opt — direct gmem write -> 0.45x to 0.60x @32K
+`gdn_bench_uw3.py`: dropped 32KB f32 sZ staging, write wgmma acc straight to gmem (output viewed as
+[NT,BT,H,DV] blocks, partition_C(gU[chunk,None,head,None])). U/W @32K 0.976->0.738ms (0.45x->0.60x),
+correctness cos 1.0. Occupancy lever confirmed. Remaining cost = the transposed sBt build loops
+(beta*V[kk,n] -> sBt[n,kk], 128x64, scalar convert/exp).
+
+### NEXT: honing-5d — eliminate the transpose-build via MN-major B operand + pre-scaled Ai (big lever)
+U = Ai@(beta*V) = (Ai*diag(beta)) @ V = Ais @ V. Build Ais[i,kk]=Ai[i,kk]*beta[kk] (64x64, cheap) instead
+of betaV[128x64 transposed]. Then feed V DIRECTLY as B operand with b_leading_mode=OperandMajorMode.MN
+(B stored [K,N]=V as-loaded, acc=A@B standard, NO transpose). Same for W: Aig[i,kk]=Ai[i,kk]*beta[kk]*exp(g[kk]),
+W=Aig@K. Eliminates the 128x64 transposed scalar builds entirely -> should be the big U/W win. Needs
+MN-major B smem layout (make_smem_layout COL_MAJOR) + correct operand mode. Then re-bench; then KKT opt.
+
+## Honing-5d (2026-06-12): MN-major B operand hit a wgmma desc wall — keeping 0.60x U/W, pivot to KKT
+`gdn_bench_uw4.py` (pre-scaled Ai + feed V/K directly as MN-major B): IR fails to legalize
+`cute_nvgpu.make_gmma_smem_desc` with major<mn> on the [64,128] B smem (swizzle S<3,4,3>). MN-major
+GMMA operands need a specific smem layout atom that the plain make_smem_layout(ROW_MAJOR,(64,128)) doesn't
+produce; getting it right is non-trivial (deep wgmma operand-layout rules). NOT worth rabbit-holing.
+DECISION: keep the 0.60x U/W (gdn_bench_uw3.py, occupancy opt) as the U/W result; the transpose-build
+elimination is deferred. PIVOT to KKT opt (the other stage, 0.66x).
+
+### NEXT: honing-6 — optimize KKT->A (0.66x@32K). gdn_bench_stages.py::_grid_kkt does K@Kᵀ (one wgmma,
+K=128) + A modulation (decay/beta/tril) + write. Levers: (1) direct-gmem-write A (drop sA staging like
+the U/W win); (2) fewer barriers; (3) the decay/beta/exp modulation is scalar 64x64 — fold/vectorize.
+KKT improves with T (0.36->0.66x), so at long seqlens it's closest to parity. Then re-sum 3 stages vs FLA.
+
+## Honing-6 DEFINITIVE END-TO-END (2026-06-12): my 3 kernels vs FLA 3 stages, one run
+`gdn_bench_e2e.py` @ 35B shapes (ms; ratio = FLA_total/mine, higher=better):
+  T=2048 : myKKT 0.053 + myINV 0.056 + myUW 0.116 = 0.224 | FLA 0.073 -> 0.33x
+  T=8192 : 0.094 + 0.061 + 0.246 = 0.401 | FLA 0.216 -> 0.54x
+  T=32768: 0.242 + 0.100 + 0.738 = 1.080 | FLA 0.837 -> 0.77x  (vs fused FLA intra 0.754 -> 0.70x)
+**End-to-end kkt_inv_uw = 0.77x@32K, climbing with T (0.33->0.54->0.77).** Up from ~0.65x pre-U/W-opt.
+U/W (0.738ms) = 68% of my total -> THE gate to parity. Inverse now tiny (0.100ms, the 3.36x win). KKT 0.242.
+Trend suggests longer seqlens approach parity IF U/W transpose-build is cracked (MN-major, walled) — that
+is the one remaining high-value lever; KKT near-ceiling. Current best stage kernels: gdn_bench_stages
+(KKT), gdn_bench_inv (inverse), gdn_bench_uw3 (U/W occupancy-opt).
+
+## Honing-7 (2026-06-12): transposed-gmem-load U/W is WORSE -> U/W tractable levers EXHAUSTED
+`gdn_bench_uw5.py` (load V^T/K^T directly + pre-scaled Ai, no rebuild): 0.18/0.51/1.78ms (0.17/0.22/0.25x),
+correct (cos 1.0) but ~2.4x SLOWER than uw3 — the strided/uncoalesced transposed gmem reads dominate.
+**U/W optimization space exhausted:** occupancy/direct-gmem-write = WIN (0.45->0.60x, uw3 = best);
+MN-major B (eliminate transpose) = WALLED (gmma desc legalization); transposed-load = WORSE (uncoalesced).
+The 128x64 transpose-rebuild in uw3 is the residual cost; removing it needs the MN-major path (blocked).
+
+## FINAL STATE (2026-06-12)
+- Correctness: ALL green vs FLA/torch (cosine ≥0.999) across every stage + full pipeline.
+- INVERSE: **3.36x@32K WIN** (blocked-16x16 warp-mma NS) — TC-inverse-on-Hopper thesis PROVEN.
+- U/W: 0.60x@32K (occupancy-optimized; further blocked by wgmma MN-major wall).
+- KKT: 0.66x@32K (near-ceiling, wgmma-bound).
+- END-TO-END kkt_inv_uw: **0.77x@32K** (climbing with T: 0.33/0.54/0.77 @ 2K/8K/32K).
+VERDICT: core thesis proven (inverse 3.36x). End-to-end ~0.77x@32K, gated on U/W's transpose-build whose
+only real fix (MN-major) is blocked by a wgmma descriptor wall. Tractable optimization space is exhausted;
+reaching full parity needs cracking that wgmma-layout wall (deep, uncertain). RECOMMEND CONSOLIDATE.
+Code: github.com/jasperjiaguo/sglang @ jiaguo/gdn-hopper-kkt-experiment (b8d0833 + uncommitted honing files).
