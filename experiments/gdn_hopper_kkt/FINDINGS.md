@@ -483,3 +483,18 @@ VERDICT: core thesis proven (inverse 3.36x). End-to-end ~0.77x@32K, gated on U/W
 only real fix (MN-major) is blocked by a wgmma descriptor wall. Tractable optimization space is exhausted;
 reaching full parity needs cracking that wgmma-layout wall (deep, uncertain). RECOMMEND CONSOLIDATE.
 Code: github.com/jasperjiaguo/sglang @ jiaguo/gdn-hopper-kkt-experiment (b8d0833 + uncommitted honing files).
+
+## Honing-8/9 (2026-06-15): MN-major B wgmma CRACKED + U/W is occupancy-bound (not transpose/bw)
+**CRACKED the MN-major wall** (gdn_mnmajor_probe.py, gdn_bench_uw6.py): feed V/K DIRECTLY to wgmma, no
+transpose-build. Recipe: B shape (N,K); atom = warpgroup.make_smem_layout_atom(get_smem_layout_atom(
+LayoutEnum.COL_MAJOR, dtype, N), dtype); cute.tile_to_shape(atom,(N,K),order=(1,0)); b_leading_mode=MN;
+write sV[n,k]=gV[k,n] with n inner (coalesced). cosine 1.0. THIS is what Blackwell (transpose_B desc) and
+FLA (tl.dot) do. Pre-scale Ai by beta (cheap 64x64) instead of the 128x64 betaV transpose-build.
+RESULT: U/W 0.738->0.657ms @32K (0.60x->0.67x). Modest -> transpose-build was NOT the dominant cost.
+bf16 output (uw7) = NO change (0.671) -> NOT bandwidth-bound either.
+**DIAGNOSIS: U/W is OCCUPANCY/LATENCY-bound.** 16384 tiny 1-(chunk,head)-per-CTA launches; serial chain
+(~6 barriers + 2 wgmma + builds); actual wgmma compute ~34us total. End-to-end @32K w/ uw6: KKT 0.242 +
+inv 0.100 + UW 0.657 = 0.999ms vs FLA 0.837 -> 0.84x (up from 0.77x).
+### NEXT for 1.5x: FUSION + amortize per-CTA. Combine KKT+inverse+U/W in ONE kernel (Ai stays in smem,
+no gmem round-trips), and/or process multiple chunks/heads per CTA to hide latency. This is the Blackwell
+approach (warp-specialized + multi-stage async pipeline = their 3x). Best U/W kernel now = gdn_bench_uw6.py.
