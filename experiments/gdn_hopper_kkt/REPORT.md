@@ -90,3 +90,21 @@ with the current chunk's compute), *not* sequential fusion.
 1. ~~Crack the wgmma MN-major B layout~~ ✅ done (U/W transpose-build eliminated; U/W 0.60→0.67×).
 2. **Async multi-stage pipeline** (cp.async double-buffer + warp specialization) — the real lever for >1×.
 3. Port `h` (the largest prefill kernel) and `o` for a full-prefill speedup.
+
+---
+
+## Update — Session 3 (2026-06-21): FlashInfer SM90 GDN in-place tuning
+
+We also tuned the installed FlashInfer SM90 GDN kernel used by SGLang. Newton-Schulz ports were correct but
+slower in FlashInfer's in-kernel context:
+
+| variant | 1K | 2K | 8K |
+|---|---:|---:|---:|
+| FlashInfer baseline | 0.0541 ms | 0.1033 ms | 0.4021 ms |
+| vLLM-style NS16 port | 0.0749 ms | 0.1490 ms | 0.5929 ms |
+| direct-store beta-path patch | **0.0444 ms** | **0.0852 ms** | **0.3301 ms** |
+
+The win is not NS. For beta-enabled kernels, the full inverse smem round-trip is bypassed: we quantize the
+KKT accumulator to `InverseType`, apply the needed 8x8 diagonal/upper correction in the final register
+transform, beta-scale, then store once. Stress checks were bitwise-identical to the restored baseline for the
+tested beta/scale grid. Patch: `flashinfer_gdn_direct_store_transform.patch`.

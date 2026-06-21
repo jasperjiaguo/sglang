@@ -1,0 +1,46 @@
+diff --git a/flashinfer/data/include/flashinfer/flat/hopper/collective/flat_collective_tma_warpspecialized_delta_rule.hpp b/flashinfer/data/include/flashinfer/flat/hopper/collective/flat_collective_tma_warpspecialized_delta_rule.hpp
+--- a/flashinfer/data/include/flashinfer/flat/hopper/collective/flat_collective_tma_warpspecialized_delta_rule.hpp
++++ b/flashinfer/data/include/flashinfer/flat/hopper/collective/flat_collective_tma_warpspecialized_delta_rule.hpp
+@@ -1184,27 +1184,26 @@
+       auto tKKrKK_cv = thr_store_kk.retile_S(tKKrKK);
+       auto tKKrKK_cvt_cv = make_fragment_like<InverseType>(tKKrKK_cv);
+       cute::transform(tKKrKK_cv, tKKrKK_cvt_cv, [](auto v) { return InverseType(v); });
+-      copy(tiled_store_kk, tKKrKK_cvt_cv, tKKsKK);
+ 
+-      cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup,
+-                                                   DeltaRuleNamedBarriers::AuxMath);
+-
+-      auto collective_inverse = CollectiveInverse(DeltaRuleNamedBarriers::AuxMath);
+-      collective_inverse.compute(sKK_inv_pipe_slice);
++      if constexpr (!NeedsBeta && std::is_same_v<InverseType, Element>) {
++        copy(tiled_store_kk, tKKrKK_cvt_cv, tKKsKK);
++        cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup,
++                                                     DeltaRuleNamedBarriers::AuxMath);
++        auto collective_inverse = CollectiveInverse(DeltaRuleNamedBarriers::AuxMath);
++        collective_inverse.compute(sKK_inv_pipe_slice);
++      }
+ 
+       // FIXME: we can ignore core matrices above diagonal
+       if constexpr (NeedsBeta || !std::is_same_v<InverseType, Element>) {
+-        cutlass::arch::NamedBarrier::arrive_and_wait(cutlass::NumThreadsPerWarpGroup,
+-                                                     DeltaRuleNamedBarriers::AuxMath);
+-        using CopyOpS2R = SM75_U32x4_LDSM_N;
+-        auto tiled_load_kk = make_tiled_copy_C(Copy_Atom<CopyOpS2R, InverseType>{}, kk_tiled_mma);
+-        auto thr_load_kk = tiled_load_kk.get_thread_slice(thread_idx);
+-        auto tKKrKK_cpy = make_fragment_like<InverseType>(tKKrKK_cvt_cv);
+         auto tKKrKK_cvt = make_fragment_like<Element>(tKKrKK_cvt_cv);
+-        auto tKKcMkk_cv = thr_load_kk.retile_D(tKKcMkk);
+-        copy(tiled_load_kk, thr_load_kk.partition_S(sKK_inv_pipe_slice), tKKrKK_cpy);
+-        cute::transform(tKKrKK_cpy, tKKcMkk_cv, tKKrKK_cvt, [&](auto val, auto coord) {
+-          auto [_, t] = coord;
++        auto tKKcMkk_cv = thr_store_kk.retile_S(tKKcMkk);
++        cute::transform(tKKrKK_cvt_cv, tKKcMkk_cv, tKKrKK_cvt, [&](auto val, auto coord) {
++          auto [s, t] = coord;
++          int s_idx = int(s);
++          int t_idx = int(t);
++          if ((s_idx / 8) == (t_idx / 8) && s_idx <= t_idx) {
++            val = InverseType(s_idx == t_idx ? 1.0f : 0.0f);
++          }
+           if constexpr (NeedsBeta) {
+             return Element(float(val) * Beta(t, beta_smem_pipe_read.index()));
+           } else {

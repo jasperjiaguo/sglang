@@ -498,3 +498,33 @@ inv 0.100 + UW 0.657 = 0.999ms vs FLA 0.837 -> 0.84x (up from 0.77x).
 ### NEXT for 1.5x: FUSION + amortize per-CTA. Combine KKT+inverse+U/W in ONE kernel (Ai stays in smem,
 no gmem round-trips), and/or process multiple chunks/heads per CTA to hide latency. This is the Blackwell
 approach (warp-specialized + multi-stage async pipeline = their 3x). Best U/W kernel now = gdn_bench_uw6.py.
+
+## FlashInfer SM90 tuning (2026-06-21): direct-store beta path beats NS
+
+Target: installed FlashInfer GDN SM90 path in SGLang (`flashinfer/flat/hopper/collective/
+flat_collective_tma_warpspecialized_delta_rule.hpp`), using stable finite inputs
+(`H=16,D=128`, L2-normalized K, `g=0`, `beta=0.01`, `use_qk_l2norm_in_kernel=True`).
+
+Baseline timings:
+- T=1024: 0.0541 ms
+- T=2048: 0.1033 ms
+- T=8192: 0.4021 ms
+
+Tried NS ports:
+- Scalar NS8 replacing FlashInfer's 8x8 seed: correct but slower (2 rounds: 0.0638/0.1207/0.4646 ms;
+  3 rounds: 0.0711/0.1361/0.5252 ms).
+- Scratch-buffer NS16: compiled and correct, but slower even with fewer rounds; zero-iteration lower bound was
+  still slower than baseline due the scratch/barrier overhead.
+- vLLM PR #43273-style NS16 (`Ai_new = 2*Ai - Ai @ M @ Ai`, 3 rounds): bitwise-identical on stress checks,
+  but much slower (0.0749/0.1490/0.5929 ms). The vLLM win is tied to its SM100/tcgen05 pipelined kernel
+  structure, not directly portable as a faster drop-in for FlashInfer's SM90 collective.
+
+Best patch:
+- For the beta-enabled path, skip `CollectiveInverse::compute()` and the smem reload.
+- Reuse the already half-quantized KKT fragment, apply the 8x8 diagonal/upper correction in the final register
+  transform, multiply by `Beta(t)`, and store once.
+- Timings: **0.0444/0.0852/0.3301 ms** at 1K/2K/8K (~18% faster than baseline).
+- Stress checks vs restored baseline-equivalent outputs were bitwise-identical for beta in `{0.1, 1.0}` and
+  q/v scale in `{0.01, 0.1, 1.0}`.
+
+Checked-in patch: `flashinfer_gdn_direct_store_transform.patch`.
