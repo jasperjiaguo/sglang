@@ -523,8 +523,13 @@ Best patch:
 - For the beta-enabled path, skip `CollectiveInverse::compute()` and the smem reload.
 - Reuse the already half-quantized KKT fragment, apply the 8x8 diagonal/upper correction in the final register
   transform, multiply by `Beta(t)`, and store once.
-- Timings: **0.0444/0.0852/0.3301 ms** at 1K/2K/8K (~18% faster than baseline).
+- Timings after Hopper predicate micro-tune: **0.0446/0.0846/0.3304 ms** min at 1K/2K/8K
+  (median 0.0446/0.0847/0.3306), ~18% faster than baseline.
 - Stress checks vs restored baseline-equivalent outputs were bitwise-identical for beta in `{0.1, 1.0}` and
   q/v scale in `{0.01, 0.1, 1.0}`.
+- Online Hopper tuning guidance emphasized minimizing divergent warp work, barriers, register pressure, and
+  smem traffic; the only additional local win found was replacing the 8x8-block division predicate with an
+  unsigned xor mask. Fusing half-conversion, diagonal-first branching, and direct-float transforms all
+  regressed.
 
 Checked-in patch: `flashinfer_gdn_direct_store_transform.patch`.

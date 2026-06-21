@@ -36,9 +36,9 @@ diff --git a/flashinfer/data/include/flashinfer/flat/hopper/collective/flat_coll
 +        auto tKKcMkk_cv = thr_store_kk.retile_S(tKKcMkk);
 +        cute::transform(tKKrKK_cvt_cv, tKKcMkk_cv, tKKrKK_cvt, [&](auto val, auto coord) {
 +          auto [s, t] = coord;
-+          int s_idx = int(s);
-+          int t_idx = int(t);
-+          if ((s_idx / 8) == (t_idx / 8) && s_idx <= t_idx) {
++          uint32_t s_idx = uint32_t(s);
++          uint32_t t_idx = uint32_t(t);
++          if ((s_idx ^ t_idx) < 8u && s_idx <= t_idx) {
 +            val = InverseType(s_idx == t_idx ? 1.0f : 0.0f);
 +          }
            if constexpr (NeedsBeta) {

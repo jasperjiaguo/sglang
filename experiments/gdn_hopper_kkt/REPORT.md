@@ -102,9 +102,11 @@ slower in FlashInfer's in-kernel context:
 |---|---:|---:|---:|
 | FlashInfer baseline | 0.0541 ms | 0.1033 ms | 0.4021 ms |
 | vLLM-style NS16 port | 0.0749 ms | 0.1490 ms | 0.5929 ms |
-| direct-store beta-path patch | **0.0444 ms** | **0.0852 ms** | **0.3301 ms** |
+| direct-store beta-path patch | **0.0446 ms** | **0.0846 ms** | **0.3304 ms** |
 
 The win is not NS. For beta-enabled kernels, the full inverse smem round-trip is bypassed: we quantize the
 KKT accumulator to `InverseType`, apply the needed 8x8 diagonal/upper correction in the final register
 transform, beta-scale, then store once. Stress checks were bitwise-identical to the restored baseline for the
-tested beta/scale grid. Patch: `flashinfer_gdn_direct_store_transform.patch`.
+tested beta/scale grid. A follow-up Hopper micro-tune changed the 8x8-block predicate from division to an
+unsigned xor mask; this was bitwise-identical and slightly improved the 2K median. Patch:
+`flashinfer_gdn_direct_store_transform.patch`.
