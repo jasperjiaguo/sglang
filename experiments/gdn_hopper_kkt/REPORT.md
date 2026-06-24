@@ -8,10 +8,17 @@ climbing with sequence length**; closing the remaining gap is gated on one sub-s
 best optimization is blocked by a wgmma smem-descriptor limitation.
 
 ## Background
-GDN (gated delta net) chunked **prefill** is a 3-kernel pipeline: `kkt_inv_uw` (intra-chunk) →
-`h` (recurrent scan) → `o` (readout). Only `kkt_inv_uw` is ported here. It has 3 sub-stages:
+GDN (gated delta net) chunked **prefill** is a 3-stage logical pipeline: `kkt_inv_uw` (intra-chunk) →
+`h` (recurrent scan) → `o` (readout). Only `kkt_inv_uw` is ported here. It has 3 logical sub-stages:
 `KKT→A` (β·K·Kᵀ·decay, strictly-lower) → `inverse` ((I+A)⁻¹) → `U/W` (Ai·(β·V), Ai·(β·eᵍ·K)).
 sglang's CuteDSL version is SM100/Blackwell-only (`tcgen05`+`tmem`); Hopper fell back to FLA triton.
+
+**Fusion boundary clarification.** FLA is not a fully unfused 3-kernel baseline for `kkt_inv_uw`: SGLang's
+FLA intra path fuses `KKT→A + solve_tril` into `chunk_gated_delta_rule_fwd_kkt_solve_kernel`, then launches
+`recompute_w_u_fwd` for U/W (2 kernels total for intra). FlashInfer's `chunk_gated_delta_rule` is a single
+fused GDN prefill kernel for the recurrence itself, but SGLang still performs surrounding plumbing outside
+FlashInfer: Q/K L2 norm, `exp(g)`, beta conversion/slicing, state-pool gather/scatter, plus separate QKV
+split/gating/conv helpers.
 
 ## Approach
 Rebuilt each sub-stage in CuteDSL on Hopper-native instructions (wgmma for the 64-wide GEMMs;
@@ -110,3 +117,38 @@ transform, beta-scale, then store once. Stress checks were bitwise-identical to 
 tested beta/scale grid. A follow-up Hopper micro-tune changed the 8x8-block predicate from division to an
 unsigned xor mask; this was bitwise-identical and slightly improved the 2K median. Patch:
 `flashinfer_gdn_direct_store_transform.patch`.
+
+---
+
+## Update — Session 4 (2026-06-24): FlashInfer vs FLA fusion boundary + plumbing
+
+A fair comparison is **not** "FlashInfer one kernel vs completely unfused FLA." The boundaries are:
+
+- **FlashInfer GDN prefill:** one fused FI custom op (`flashinfer::gdn_prefill` /
+  `FlatKernelTmaWarpSpecializedDeltaRule`) that consumes already-prepared `q/k/v/g/beta/initial_state` and
+  writes output/final state.
+- **FLA intra:** two Triton kernels for `kkt_inv_uw`: fused `KKT→A + solve_tril`, then `recompute_w_u_fwd`.
+- **Shared SGLang plumbing outside the recurrence:** causal conv, QKV split/projection handling,
+  fused GDN gating (`fused_gdn_gating`), Q/K normalization, `exp(g)`/beta conversion, and state-pool
+  gather/scatter are not part of the FI prefill kernel. SGLang has its own helper fusions such as
+  `fused_qkv_split_gdn_prefill`, but those are separate from both FI and FLA recurrence kernels.
+
+With the optimized FI direct-store beta-path patch active, direct prefill microbenchmarks on H200
+(`H=16,D=128,beta=0.01`, finite stable inputs) showed:
+
+| T | baseline FI | optimized FI | optimized FLA | optimized FI speedup vs baseline | FLA / optimized FI |
+|---:|---:|---:|---:|---:|---:|
+| 1K | 0.0567 ms | 0.0483 ms | 0.2518 ms | 1.17× | 5.21× |
+| 2K | 0.1063 ms | 0.0891 ms | 0.2440 ms | 1.19× | 2.74× |
+| 8K | 0.4072 ms | 0.3371 ms | 0.4782 ms | 1.21× | 1.42× |
+| 32K | 1.6147 ms | 1.3309 ms | 1.8146 ms | 1.21× | 1.36× |
+
+A follow-up predicate micro-tune inlined the 8x8-block test to avoid extra live locals:
+`(uint32_t(s) ^ uint32_t(t)) < 8u && uint32_t(s) <= uint32_t(t)`. It was neutral/slightly faster
+than the named-local xor version (8K: 0.3353 ms vs 0.3368 ms; 32K: 1.3247 ms vs 1.3321 ms) and is the
+current patch form.
+
+Nsight tooling note: `ncu` is available under `/usr/local/cuda/bin/ncu` and `/opt/nvidia/nsight-compute/2025.3.1/ncu`,
+but NCU collection on this JIT-loaded FI custom op currently hangs or fails (`malloc(): unsorted double linked list corrupted`).
+`nsys` does capture the expected FI kernel name, but reliable NCU occupancy / SpeedOfLight numbers are still pending.
+
