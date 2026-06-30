@@ -7,6 +7,13 @@ The kernel is fully correct vs FLA/torch. End-to-end `kkt_inv_uw` is **0.77× of
 climbing with sequence length**; closing the remaining gap is gated on one sub-stage (U/W) whose
 best optimization is blocked by a wgmma smem-descriptor limitation.
 
+**Current most successful version.** For the production-style FlashInfer SM90 path, the best variant so far is
+`flashinfer_gdn_direct_store_transform.patch` with the inline xor 8x8 predicate. It is **not** the
+Newton-Schulz variant: NS ports were correct in isolation but slower or mismatched in the FlashInfer kernel
+context. The winning FI patch bypasses the beta-path inverse smem round-trip, applies the 8x8 diagonal/upper
+correction during the final register transform, multiplies by beta, and stores once. This is the version to
+use for further FI-side benchmarking unless a deeper SM90 port of the vLLM/SM100 blocked NS pipeline is attempted.
+
 ## Background
 GDN (gated delta net) chunked **prefill** is a 3-stage logical pipeline: `kkt_inv_uw` (intra-chunk) →
 `h` (recurrent scan) → `o` (readout). Only `kkt_inv_uw` is ported here. It has 3 logical sub-stages:
@@ -148,7 +155,11 @@ A follow-up predicate micro-tune inlined the 8x8-block test to avoid extra live 
 than the named-local xor version (8K: 0.3353 ms vs 0.3368 ms; 32K: 1.3247 ms vs 1.3321 ms) and is the
 current patch form.
 
+**Current recommendation:** continue from the direct-store beta-path + inline-xor patch. Do not treat the
+vLLM-style NS16/NS8 attempts as the best FI baseline; in the FlashInfer SM90 context they either regressed
+or did not preserve the expected output semantics. The next credible optimization should target surrounding
+SGLang plumbing or a deeper pipeline-level port, not another local replacement of the existing FI inverse seed.
+
 Nsight tooling note: `ncu` is available under `/usr/local/cuda/bin/ncu` and `/opt/nvidia/nsight-compute/2025.3.1/ncu`,
 but NCU collection on this JIT-loaded FI custom op currently hangs or fails (`malloc(): unsorted double linked list corrupted`).
 `nsys` does capture the expected FI kernel name, but reliable NCU occupancy / SpeedOfLight numbers are still pending.
-
