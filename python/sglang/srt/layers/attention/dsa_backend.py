@@ -1288,7 +1288,14 @@ class DeepseekSparseAttnBackend(
         # until those paths also understand packed verification query rows.
         return (
             is_cuda()
-            and self.dsa_decode_impl == "flashmla_sparse"
+            and (
+                self.dsa_decode_impl == "flashmla_kv"
+                or (
+                    self.dsa_decode_impl == "flashmla_sparse"
+                    and not self.dsa_kv_cache_store_fp8
+                    and self.kv_cache_dtype == torch.bfloat16
+                )
+            )
             and self.attn_dcp_size == 1
             and self.dsa_index_kpool == 1
             and self.hisparse_coordinator is None
@@ -1306,7 +1313,8 @@ class DeepseekSparseAttnBackend(
         """
         if not self.supports_ragged_verify_graph:
             raise NotImplementedError(
-                "Packed DSA verification requires CUDA flashmla_sparse attention, "
+                "Packed DSA verification requires CUDA flashmla_kv or BF16 "
+                "flashmla_sparse attention, "
                 "DCP=1, index_kpool=1 and resident, unsharded KV caches"
             )
         layout = forward_batch.ragged_verify_layout
@@ -1391,6 +1399,11 @@ class DeepseekSparseAttnBackend(
                 paged_mqa_schedule_metadata=resolve_paged_mqa_logits_metadata_fn()(
                     ctx_lens, 64, resolve_num_sms()
                 ),
+                flashmla_metadata=(
+                    self._compute_flashmla_metadata(dsa_cache_seqlens, seq_len_q=1)
+                    if self.dsa_decode_impl == "flashmla_kv"
+                    else None
+                ),
                 topk_v2_plan=self._build_topk_v2_plan(query_seq_lens),
             )
             if cuda_graph:
@@ -1426,6 +1439,12 @@ class DeepseekSparseAttnBackend(
                 metadata, metadata.paged_mqa_ctx_lens_2d
             )
             self._refresh_topk_v2_plan(metadata)
+            if metadata.flashmla_metadata is not None:
+                metadata.flashmla_metadata.copy_(
+                    self._compute_flashmla_metadata(
+                        metadata.dsa_cache_seqlens_int32, seq_len_q=1
+                    )
+                )
         self.forward_metadata = metadata
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -3784,6 +3803,11 @@ class DeepseekSparseAttnBackend(
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
         if not dcp_partial:
+            if getattr(forward_batch, "ragged_verify_layout", None) is not None:
+                # Empty graph rows have no selected key and no attention sink.
+                # A native kernel may leave their softmax output undefined;
+                # overwrite it before padded hidden states reach quantization.
+                o.masked_fill_(cache_seqlens.view(-1, 1, 1, 1) == 0, 0)
             return _restore_live_rows(o, plan)
 
         # Partial result for the DCP merge: [T, H, D] and its natural-log LSE
