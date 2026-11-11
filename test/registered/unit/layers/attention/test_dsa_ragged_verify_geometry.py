@@ -5,8 +5,10 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.kernels.ops.speculative.ragged_verify_kernels import PadVerifyLayout
 from sglang.srt.layers.attention.dsa.ragged_verify import update_ragged_dsa_query_rows
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -103,6 +105,49 @@ class TestDSARaggedVerifyGeometry(unittest.TestCase):
             with self.subTest(shapes=[getattr(x, "shape", None) for x in args]):
                 with self.assertRaises(ValueError):
                     update_ragged_dsa_query_rows(*args)
+
+
+class TestCappedVerifyLayout(CustomTestCase):
+    def test_graph_slack_does_not_extend_the_last_real_request(self):
+        """A full request tier can still have unused token rows; these must
+        never become extra recurrent steps for its final real request."""
+        out = PadVerifyLayout.torch(
+            verify_lens=torch.ones(8, dtype=torch.int32),
+            graph_num_tokens=16,
+            padded_bs=8,
+            cap=6,
+        )
+        pointers = tuple(
+            x.data_ptr() for x in (out.verify_lens, out.qo_indptr, out.extend_start_loc)
+        )
+        for widths in ([1] * 8, [1, 3, 1, 1, 1, 1, 1, 1]):
+            with self.subTest(widths=widths):
+                PadVerifyLayout.torch(
+                    verify_lens=torch.tensor(widths, dtype=torch.int32),
+                    graph_num_tokens=16,
+                    padded_bs=8,
+                    cap=6,
+                    out=out,
+                )
+                self.assertEqual(out.verify_lens.tolist(), widths)
+                self.assertEqual(out.qo_indptr[-1].item(), sum(widths))
+                self.assertEqual(
+                    tuple(
+                        x.data_ptr()
+                        for x in (out.verify_lens, out.qo_indptr, out.extend_start_loc)
+                    ),
+                    pointers,
+                )
+
+    def test_uncapped_layout_still_covers_the_token_tier(self):
+        """Full-coverage consumers retain their explicit padding convention."""
+        out = PadVerifyLayout.torch(
+            verify_lens=torch.ones(8, dtype=torch.int32),
+            graph_num_tokens=16,
+            padded_bs=8,
+        )
+        self.assertEqual(out.verify_lens.tolist(), [1] * 7 + [9])
+        self.assertEqual(out.qo_indptr[-1].item(), 16)
 
 
 if __name__ == "__main__":
