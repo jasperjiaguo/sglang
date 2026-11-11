@@ -383,7 +383,8 @@ def test_dflash_family_accept_uses_block_verification(any_greedy):
 
 
 @pytest.mark.parametrize("block", [False, True])
-def test_ragged_cutoff_preserves_distribution(block):
+@pytest.mark.parametrize("uniform_padding", [False, True])
+def test_ragged_cutoff_preserves_distribution(block, uniform_padding):
     """DSpark compact verify: rows past a request's verify window are point-mass
     padding and the accept is capped at verify_lens - 1. With verify lengths
     chosen from x_<i only, the emitted tokens must still follow the target."""
@@ -405,8 +406,11 @@ def test_ragged_cutoff_preserves_distribution(block):
     verify_lens = 1 + (survival >= 0.5).sum(dim=1).to(torch.int32)
     target_logits = torch.log(target_transition[candidates])
     row = torch.arange(gamma + 1, device=DEVICE).view(1, -1)
+    # After gathering TP shards, each shard can contribute its local point
+    # mass to a padded row. Test both one peak and the two-shard uniform law.
+    padding_logits = [0.0, 0.0] if uniform_padding else [0.0, -1.0e4]
     target_logits[row >= verify_lens.view(-1, 1)] = torch.tensor(
-        [0.0, -1.0e4], device=DEVICE
+        padding_logits, device=DEVICE
     )
     correct_len, bonus, _ = accept_draft_tokens(
         candidates=candidates,

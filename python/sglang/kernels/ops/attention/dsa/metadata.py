@@ -5,6 +5,70 @@ import triton
 import triton.language as tl
 
 
+@triton.jit
+def _dsa_ragged_query_rows_kernel(
+    seq_lens,
+    req_pool_indices,
+    qo_indptr,
+    query_seq_lens,
+    query_req_pool_indices,
+    seq_lens_stride: tl.constexpr,
+    req_pool_stride: tl.constexpr,
+    qo_stride: tl.constexpr,
+    num_requests: tl.constexpr,
+    num_tokens: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    tokens = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    # upper_bound(qo_indptr[1:], token), including repeated boundaries from
+    # zero-length graph request slots. The final result can be num_requests:
+    # capped token tiers need not be fully covered by request slots.
+    lo = tl.full((BLOCK,), 0, tl.int32)
+    hi = tl.full((BLOCK,), num_requests, tl.int32)
+    while tl.sum((lo < hi).to(tl.int32), 0) > 0:
+        mid = (lo + hi) // 2
+        end = tl.load(
+            qo_indptr + (mid + 1) * qo_stride,
+            mask=mid < num_requests,
+            other=0x7FFFFFFF,
+        )
+        advance = (lo < hi) & (tokens >= end)
+        hi = tl.where((lo < hi) & ~advance, mid, hi)
+        lo = tl.where(advance, mid + 1, lo)
+    live = (tokens < num_tokens) & (lo < num_requests)
+    start = tl.load(qo_indptr + lo * qo_stride, mask=live, other=0)
+    prefix_len = tl.load(seq_lens + lo * seq_lens_stride, mask=live, other=0)
+    owner = tl.load(req_pool_indices + lo * req_pool_stride, mask=live, other=0)
+    lengths = tl.where(live, prefix_len + tokens - start + 1, 0)
+    tl.store(query_seq_lens + tokens, lengths, mask=tokens < num_tokens)
+    tl.store(query_req_pool_indices + tokens, owner, mask=tokens < num_tokens)
+
+
+def fused_dsa_ragged_query_rows(
+    seq_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    query_seq_lens: torch.Tensor,
+    query_req_pool_indices: torch.Tensor,
+) -> None:
+    """Expand packed verify ownership/causal lengths into preallocated buffers."""
+    if query_seq_lens.numel() == 0:
+        return
+    _dsa_ragged_query_rows_kernel[(triton.cdiv(query_seq_lens.numel(), 128),)](
+        seq_lens,
+        req_pool_indices,
+        qo_indptr,
+        query_seq_lens,
+        query_req_pool_indices,
+        seq_lens.stride(0),
+        req_pool_indices.stride(0),
+        qo_indptr.stride(0),
+        qo_indptr.numel() - 1,
+        query_seq_lens.numel(),
+        BLOCK=128,
+    )
+
+
 @triton.jit(
     do_not_specialize=[
         "page_table_stride_0",

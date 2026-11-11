@@ -88,6 +88,9 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolExtendPlan,
     KPoolWritePlan,
 )
+from sglang.srt.layers.attention.dsa.ragged_verify import (
+    update_ragged_dsa_query_rows,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_interleave,
     compute_dsa_seqlens,
@@ -1244,6 +1247,13 @@ class DeepseekSparseAttnBackend(
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and getattr(forward_batch, "ragged_verify_layout", None) is not None
+        ):
+            self._init_ragged_verify_metadata(forward_batch, cuda_graph=True)
+            self.init_kernel_metadata(forward_batch)
+            return
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -1271,8 +1281,162 @@ class DeepseekSparseAttnBackend(
         """Refresh custom kernel state after eager or out-of-graph metadata setup."""
         pass
 
+    @property
+    def supports_ragged_verify_graph(self) -> bool:
+        # Sharded index-K, pooled index-K and host offload have additional
+        # request-major metadata/reshape contracts. Keep their existing gate
+        # until those paths also understand packed verification query rows.
+        return (
+            is_cuda()
+            and self.dsa_decode_impl == "flashmla_sparse"
+            and self.attn_dcp_size == 1
+            and self.dsa_index_kpool == 1
+            and self.hisparse_coordinator is None
+            and self._kv_shard_pool is None
+        )
+
+    def _init_ragged_verify_metadata(
+        self, forward_batch: ForwardBatch, *, cuda_graph: bool
+    ) -> None:
+        """Use DSA's one-query decode geometry for a packed verify block.
+
+        Each query owns a page-table row and a causal KV length. In particular,
+        cache_seqlens is query-major here: the indexer must not infer a uniform
+        [requests, next_n] grouping from a ragged verification batch.
+        """
+        if not self.supports_ragged_verify_graph:
+            raise NotImplementedError(
+                "Packed DSA verification requires CUDA flashmla_sparse attention, "
+                "DCP=1, index_kpool=1 and resident, unsharded KV caches"
+            )
+        layout = forward_batch.ragged_verify_layout
+        assert layout is not None
+        num_tokens = layout.graph_num_tokens
+        key = (forward_batch.batch_size, num_tokens)
+        self.set_dsa_prefill_impl(forward_batch)
+
+        cached = self.ragged_verify_cuda_graph_metadata.get(key) if cuda_graph else None
+        if cached is None:
+            # The graph's page table is shared across tiers exactly like the
+            # uniform decode tables; all per-row lengths/schedules belong to
+            # this (request slots, token tier) capture and retain their address.
+            page_table = (
+                self.decode_cuda_graph_metadata["page_table"][:num_tokens]
+                if cuda_graph
+                else torch.zeros(
+                    (num_tokens, self.req_to_token.shape[1]),
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
+            assert page_table is not None
+            assert page_table.shape[0] == num_tokens
+            query_seq_lens = torch.empty(
+                num_tokens, dtype=torch.int32, device=self.device
+            )
+            query_req_pool_indices = torch.empty(
+                num_tokens,
+                dtype=forward_batch.req_pool_indices.dtype,
+                device=self.device,
+            )
+            dsa_cache_seqlens = torch.empty_like(query_seq_lens)
+            cu_seqlens_k = torch.empty(
+                num_tokens + 1, dtype=torch.int32, device=self.device
+            )
+            dsa_cu_seqlens_k = torch.empty_like(cu_seqlens_k)
+            cu_seqlens_q = self.get_device_int32_arange(num_tokens + 1)
+            real_page_table = self._transform_table_1_to_real(page_table)
+            # Populate before constructing data-dependent FlashMLA, indexer
+            # scheduling and folded top-k plans.
+            update_ragged_dsa_query_rows(
+                forward_batch.seq_lens,
+                forward_batch.req_pool_indices,
+                layout,
+                query_seq_lens,
+                query_req_pool_indices,
+            )
+            self._fused_decode_metadata(
+                query_seq_lens,
+                query_req_pool_indices,
+                self.req_to_token,
+                query_seq_lens,
+                cu_seqlens_k,
+                page_table,
+                dsa_cache_seqlens,
+                dsa_cu_seqlens_k,
+                real_page_table,
+                num_tokens,
+                page_table.shape[1],
+                self.dsa_index_topk,
+                self.physical_page_size,
+            )
+            # Native next_n kernels assume identical query widths. [T, 1]
+            # selects their general one-query route instead, including on SM100.
+            ctx_lens = query_seq_lens.view(-1, 1)
+            metadata = DSAMetadata(
+                page_size=self.physical_page_size,
+                cache_seqlens_int32=query_seq_lens,
+                max_seq_len_q=1,
+                max_seq_len_k=page_table.shape[1],
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                page_table_1=page_table,
+                real_page_table=real_page_table,
+                dsa_cache_seqlens_int32=dsa_cache_seqlens,
+                dsa_cu_seqlens_q=cu_seqlens_q,
+                dsa_cu_seqlens_k=dsa_cu_seqlens_k,
+                dsa_seqlens_expanded=query_seq_lens,
+                dsa_extend_seq_lens_list=[1] * num_tokens,
+                paged_mqa_ctx_lens_2d=ctx_lens,
+                paged_mqa_schedule_metadata=resolve_paged_mqa_logits_metadata_fn()(
+                    ctx_lens, 64, resolve_num_sms()
+                ),
+                topk_v2_plan=self._build_topk_v2_plan(query_seq_lens),
+            )
+            if cuda_graph:
+                self.ragged_verify_cuda_graph_metadata[key] = (
+                    metadata,
+                    query_req_pool_indices,
+                )
+        else:
+            metadata, query_req_pool_indices = cached
+            update_ragged_dsa_query_rows(
+                forward_batch.seq_lens,
+                forward_batch.req_pool_indices,
+                layout,
+                metadata.cache_seqlens_int32,
+                query_req_pool_indices,
+            )
+            self._fused_decode_metadata(
+                metadata.cache_seqlens_int32,
+                query_req_pool_indices,
+                self.req_to_token,
+                metadata.cache_seqlens_int32,
+                metadata.cu_seqlens_k,
+                metadata.page_table_1,
+                metadata.dsa_cache_seqlens_int32,
+                metadata.dsa_cu_seqlens_k,
+                metadata.real_page_table,
+                num_tokens,
+                metadata.max_seq_len_k,
+                self.dsa_index_topk,
+                self.physical_page_size,
+            )
+            self._refresh_paged_mqa_schedule_metadata(
+                metadata, metadata.paged_mqa_ctx_lens_2d
+            )
+            self._refresh_topk_v2_plan(metadata)
+        self.forward_metadata = metadata
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and getattr(forward_batch, "ragged_verify_layout", None) is not None
+        ):
+            self._init_ragged_verify_metadata(forward_batch, cuda_graph=False)
+            self.init_kernel_metadata(forward_batch)
+            return
         batch_size = forward_batch.batch_size
         device = forward_batch.seq_lens.device
 
@@ -1713,6 +1877,7 @@ class DeepseekSparseAttnBackend(
         This creates fixed-size tensors that will be reused during CUDA graph replay
         to avoid memory allocations.
         """
+        self.ragged_verify_cuda_graph_metadata: Dict = {}
         # Whether we can skip the wide [max_num_tokens, max_ctx_len] page_size=1
         # page table in the decode CUDA graph. It is dead weight there only when the
         # decode top-k routes to the fused v2 kernel: attention reads topk_indices
